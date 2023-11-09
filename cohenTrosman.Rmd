@@ -1,0 +1,244 @@
+---
+title: "Cohen - Baseline R - House and Mortgage data"
+author: "Trosman, Denis"
+date: "11/6/2023"
+runtime: shiny
+output:
+  html_document:
+    theme: darkly
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introducción
+
+Para realizar la prueba de R se utilizará el dataset de TidyTuesday con información de precios de hogares e hipotecas de USA.
+
+El Índice de Precios de Viviendas (HPI, por sus siglas en inglés) es una amplia medida del movimiento de los precios de casas unifamiliares. El HPI es un índice ponderado de ventas repetidas, lo que significa que mide los cambios promedio en los precios en ventas repetidas o refinanciamientos de las mismas propiedades. Esta información se obtiene revisando las transacciones de hipotecas repetidas en propiedades unifamiliares cuyas hipotecas han sido compradas o securitizadas por Fannie Mae o Freddie Mac desde enero de 1975.
+
+Link al dataset -> https://github.com/rfordatascience/tidytuesday/tree/master/data/2019/2019-02-05
+
+## Carga de librerias y seteo
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(ggplot2)
+library(plotly)
+library(shiny)
+ggplot2::theme_set(theme_bw())
+```
+
+Limpiamos consola y eliminamos notación cientifica
+
+```{r}
+rm(list = ls()) 
+options(scipen = 999) 
+```
+
+## Carga de datos
+
+Leemos las tablas del dataset entregado por TidyTuesday
+
+```{r, message=FALSE, warning=FALSE}
+state_hpi <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2019/2019-02-05/state_hpi.csv")
+mortgage_rates <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2019/2019-02-05/mortgage.csv")
+```
+
+## Conexión a DB
+```{r}
+con <- dbConnect(RSQLite::SQLite(), dbname = ":memory:")
+```
+
+## Carga de tablas
+```{r}
+dbWriteTable(con, "state_hpi", state_hpi)
+
+mortgage_rates <- mortgage_rates %>%
+  mutate(year = lubridate::year(date),
+         month = lubridate::month(date))
+
+dbWriteTable(con, "mortgage_rates", mortgage_rates)
+```
+
+### Comprobación de lectura
+
+```{r}
+df_state<- dbGetQuery(con, "SELECT * FROM state_hpi")
+```
+
+```{r echo = FALSE}
+head(df_state)
+```
+
+### Resumen de datos
+```{r}
+modelsummary::datasummary_skim(df_state)
+```
+
+## Exploración inicial de datos
+
+### Índice de precios según estado a lo largo de los años
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+ui <- fluidPage(
+  titlePanel("Índice de precios a lo largo de los años"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("state", "Select a US State:", 
+                  choices = unique(df_state$state),
+                  selected = unique(df_state$state)[1])
+    ),
+    mainPanel(
+      plotlyOutput("plot")
+    )
+  )
+)
+
+server <- function(input, output) {
+  output$plot <- renderPlotly({
+    filtered_data <- df_state[df_state$state == input$state, ]
+    
+    p <- ggplot(filtered_data, aes(x = year, y = price_index)) +
+      geom_line()
+    
+    plot_title <- paste("Price Index by State:", input$state)
+    
+    ggplotly(p) %>%
+      layout(title = plot_title)
+
+  })
+}
+
+shinyApp(ui, server)
+```
+
+# Cuestion 1: La variación del indice de precios de viviendas es igual en todos los estados
+
+Primero podemos calcular las variaciones anuales
+
+```{r, message=FALSE, warning=FALSE}
+query <- "SELECT year, state,
+        ((MAX(CASE WHEN month = 12 THEN price_index END) / MAX(CASE WHEN month = 1 THEN price_index END))-1)*100 AS variation
+        FROM state_hpi 
+        GROUP BY 1,2"
+
+grouped_df <- dbGetQuery(con,query)
+```
+
+Visualizamos las estadisticas
+
+```{r, message=FALSE, warning=FALSE}
+modelsummary::datasummary_skim(grouped_df$variation)
+```
+
+Filtrar por estado
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE, fig.width=8, fig.height=4}
+ui <- fluidPage(
+  titlePanel("Variación del índice de precios anual según estado"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("state", "Select a US State:", 
+                  choices = unique(grouped_df$state),
+                  selected = unique(grouped_df$state)[1])
+    ),
+    mainPanel(
+      plotlyOutput("plot")
+    )
+  )
+)
+
+server <- function(input, output) {
+  output$plot <- renderPlotly({
+    filtered_data <- grouped_df[grouped_df$state == input$state, ]
+    
+    p <- ggplot(filtered_data, aes(x = year, y = variation)) +
+      geom_line()
+    
+    plot_title <- paste("Variation of Price Index by State:", input$state)
+    
+    ggplotly(p) %>%
+      layout(title = plot_title)
+
+  })
+}
+
+shinyApp(ui, server)
+```
+
+Podemos ver la variacion total para cada estado, y compararlo facilmente en un grafico de barras:
+
+```{r, message=FALSE, warning=FALSE}
+df_ordered <- df_state %>%
+  arrange(state, year, month)
+
+first_values <- df_ordered %>%
+  group_by(state) %>%
+  summarize(first_value = first(price_index))
+
+last_values <- df_ordered %>%
+  group_by(state) %>%
+  summarize(last_value = last(price_index))
+
+result_df <- last_values %>%
+  inner_join(first_values, by = "state") %>%
+  mutate(variation = ((last_value / first_value)-1)*100) %>%
+  select(state, variation)
+```
+
+Algunos estados como California y DC se encuentran muy por encima del promedio en cuanto a variacion desde 1975 a 2018, mientras que otros como AK y WI, por debajo.
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+result_df <- result_df[order(-result_df$variation), ]
+
+average_variation <- mean(result_df$variation)
+
+plot_ly(result_df, x = ~state, y = ~variation, type = 'bar', marker = list(color = 'blue')) %>%
+  layout(title = "Variación desde 1975 a 2018 del indice de precios para cada estado", xaxis = list(title = "States"), yaxis = list(title = "Variation")) %>%
+  add_trace(y = ~average_variation, type = 'scatter', mode = 'lines', name = 'Average', line = list(color = 'red', width = 2, showlegend = FALSE))
+```
+
+La variación no es igual para todos los estados, como se puede notar en los graficos individuales y en la comparación total.
+
+# Cuestion 2: La evolución del índice de precios esta relacionada con la de las tasas de interes hipotecarias
+
+
+Leemos las tasas de interes y el promedio de USA para el indice de precios a lo largo del tiempo
+```{r, message=FALSE, warning=FALSE}
+df_mortgages<- dbGetQuery(con, "
+                                with df_usa_avg as (select year,month,avg(us_avg) as us_avg
+                                from state_hpi
+                                group by 1,2)
+                                SELECT year,month, avg(fixed_rate_30_yr) as rate_30_y_avg, us_avg 
+                                  FROM mortgage_rates
+                                  left join df_usa_avg using(year,month)
+                                  WHERE year >= 1975
+                                  group by 1,2") %>% drop_na() #Ultimo mes
+```
+
+```{r, message=FALSE, warning=FALSE}
+head(df_mortgages)
+```
+
+La correlacion lineal es alta y negativa
+```{r, message=FALSE, warning=FALSE}
+cor(df_mortgages$rate_30_y_avg, df_mortgages$us_avg)
+```
+
+Visualmente, podemos ver que mientras la tasa de interes fue reduciendose, el indice de precios continuo subiendo.
+
+```{r, message=FALSE, warning=FALSE}
+plot_ly(data = df_mortgages, x = ~year) %>%
+  add_lines(y = ~rate_30_y_avg, name = "rate_30_y_avg", yaxis = "y1") %>%
+  add_lines(y = ~us_avg, name = "us_avg", yaxis = "y2") %>%
+  layout(
+    yaxis = list(title = "rate_30_y_avg", side = "left", showline = TRUE),
+    yaxis2 = list(title = "us_avg", side = "right", overlaying = "y", showline = TRUE),
+    xaxis = list(title = "Date"),
+    title = "Evolution of rate_30_y_avg and us_avg",
+    showlegend = TRUE
+  )
+```
